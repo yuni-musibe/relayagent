@@ -104,6 +104,12 @@ export function workspaceDir(l: Ledger, pkg: string): string {
   return d;
 }
 
+// 스토어 인덱스 URL. 기본값 = 퍼스트파티 스토어 정본 — 포크해도 .env 없이 마켓이 열린다.
+// RELAY_STORE_INDEX 로 오버라이드 (다른 스토어·로컬 serve 개발용). 빈 문자열 = 원격 없음(로컬 선반만).
+// 클라이언트는 이 설정과 인덱스 version 계약만 안다 — C2C 호환 규율 1
+const DEFAULT_STORE_INDEX = "https://relay-store-psi.vercel.app/index.json";
+export const STORE_INDEX_URL = (process.env.RELAY_STORE_INDEX ?? DEFAULT_STORE_INDEX).trim();
+
 // stage = 파일 교환 무대. 업로드가 앉고 다운로드 라우트가 여기로만 봉인된다.
 // workspace 와 분리하는 이유: workspace 가 ~ 처럼 넓어도 HTTP 로 나가는 범위는 여기뿐이어야 한다
 export function stageDir(pkg: string): string {
