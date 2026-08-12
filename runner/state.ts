@@ -129,10 +129,10 @@ export function artifactsDir(): string {
   return d;
 }
 
-// 스토어 인덱스 URL. 기본값 = 퍼스트파티 스토어 정본 — 포크해도 .env 없이 마켓이 열린다.
-// RELAY_STORE_INDEX 로 오버라이드 (다른 스토어·로컬 serve 개발용). 빈 문자열 = 원격 없음(로컬 선반만).
+// 스토어 인덱스 URL. 기본값 = 빈 문자열(원격 없음, 로컬 선반만) — OSS 는 스토어 없이 완결된 놀이터다.
+// 스토어 연결은 원하는 쪽이 켠다: 데스크탑 앱이 번들 데몬에 주입하거나, RELAY_STORE_INDEX 로 직접 지정.
 // 클라이언트는 이 설정과 인덱스 version 계약만 안다 — C2C 호환 규율 1
-const DEFAULT_STORE_INDEX = "https://relay-store-psi.vercel.app/index.json";
+const DEFAULT_STORE_INDEX = "";
 export const STORE_INDEX_URL = (process.env.RELAY_STORE_INDEX ?? DEFAULT_STORE_INDEX).trim();
 
 // 다운로드 캐시. digest 를 파일명 키로 쓰므로 불변이다 — 같은 봉인은 다시 받지 않는다

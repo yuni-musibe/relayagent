@@ -114,7 +114,7 @@ async function main(): Promise<void> {
 
     case "install": {
       const target = args.find((a) => !a.startsWith("--"));
-      if (!target) throw new Error("사용법: relay install <디렉토리|아티팩트.relay> [--ring0] [--name n] [--workspace dir] [--yes] [--digest sha256:...]");
+      if (!target) throw new Error("사용법: relay install <디렉토리|아티팩트.relay|@scope/name> [--store 인덱스URL] [--key RELAY-...] [--ring0] [--name n] [--workspace dir] [--yes] [--digest sha256:...]");
 
       // 아티팩트(.relay) 또는 스토어 ref(@scope/name) — 봉인 검증과 동의 관문을 지나
       // 릴리스 자리로 앉는다. 디렉토리 설치와 달리 동의 전에는 패키지 코드가 한 줄도 실행되지 않는다
@@ -122,10 +122,12 @@ async function main(): Promise<void> {
         const { prepareArtifact, activatePrepared } = await import("./installer.ts");
         let p: import("./installer.ts").Prepared;
         if (target.startsWith("@")) {
-          if (!STORE_INDEX_URL) throw new Error("스토어가 설정되지 않았습니다 — .env 에 RELAY_STORE_INDEX=<인덱스 URL> 을 지정하세요");
+          // 스토어 연결은 부르는 쪽이 켠다: --store 일회 지정 > RELAY_STORE_INDEX. 기본은 꺼짐 (OSS 에 마켓 없음)
+          const storeUrl = flag("store") ?? STORE_INDEX_URL;
+          if (!storeUrl) throw new Error("스토어가 설정되지 않았습니다 — --store <인덱스 URL> 을 붙이거나 .env 에 RELAY_STORE_INDEX 를 지정하세요");
           const { fetchStoreIndex, downloadArtifact, redeemArtifact } = await import("./registry.ts");
           const { vaultGet, vaultSet } = await import("./vault.ts");
-          const idx = await fetchStoreIndex(STORE_INDEX_URL);
+          const idx = await fetchStoreIndex(storeUrl);
           const entry = idx.entries.find((e) => e.ref === target);
           if (!entry) throw new Error(`스토어에 없는 패키지: ${target}`);
           let file: string;
@@ -138,13 +140,13 @@ async function main(): Promise<void> {
             if (!key) {
               throw new Error(`유료 패키지입니다 (₩${entry.price.toLocaleString()}) — 구매 후 받은 키를 --key RELAY-... 로 넣으세요`);
             }
-            file = await redeemArtifact(STORE_INDEX_URL, idx.redeem, entry, key);
+            file = await redeemArtifact(storeUrl, idx.redeem, entry, key);
             vaultSet(`store-key/${entry.ref}`, key.trim());
           } else {
-            file = await downloadArtifact(STORE_INDEX_URL, entry);
+            file = await downloadArtifact(storeUrl, entry);
           }
           console.log(`받음: ${entry.ref}@${entry.version} (${(entry.size / 1024).toFixed(0)}KB, 봉인 대조 통과)`);
-          p = prepareArtifact(ledger, file, { name: flag("name"), digest: entry.digest, registry: STORE_INDEX_URL });
+          p = prepareArtifact(ledger, file, { name: flag("name"), digest: entry.digest, registry: storeUrl });
         } else {
           p = prepareArtifact(ledger, target, { name: flag("name"), digest: flag("digest") });
         }
@@ -421,7 +423,7 @@ async function main(): Promise<void> {
           "relay - 개인 기판 씨앗",
           "",
           "  relay daemon                          기판 기동 (API, 서비스, 트리거, 콘솔)",
-          "  relay install <dir> [--ring0] [--workspace dir]  패키지 설치 (디렉토리 = 설치본, workspace = 폴더 결재)",
+          "  relay install <dir|.relay|@scope/name> [--store url] [--key k]  패키지 설치 (디렉토리·봉투·스토어 ref)",
           "  relay ls | rm <이름>                   목록 | 제거",
           "  relay validate <dir>                  manifest 판정",
           "  relay draft <이름>                     수정 레이어 열기 (설치본 사본, ~/.relay/drafts)",

@@ -109,14 +109,6 @@ export default function Console() {
             </Link>
           ))}
         </div>
-        {/* 보관함 — 내 선반과 설치 착지점. 스토어 구경은 보관함 상단의 웹 링크로 (진열의 정본 = 스토어프론트) */}
-        <Link className="rc-btn" style={{ textAlign: "center", textDecoration: "none", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }} href="/market/">
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" strokeLinecap="round" aria-hidden="true">
-            <path d="M3 5.5 L8 3 L13 5.5 L13 11 L8 13.5 L3 11 Z" />
-            <path d="M3 5.5 L8 8 L13 5.5 M8 8 L8 13.5" />
-          </svg>
-          보관함
-        </Link>
         <Link className="rc-btn accent" style={{ textAlign: "center", textDecoration: "none" }} href="/studio/?new=1">
           + 패키지 만들기
         </Link>
