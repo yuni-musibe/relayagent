@@ -3,11 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { API_PORT, PRINCIPAL, RELAY_HOME, loadLedger, tokenToPkg, stageDir, workspacePath, type Grant, type Ledger } from "./state.ts";
+import { API_PORT, PRINCIPAL, RELAY_HOME, STORE_INDEX_URL, loadLedger, tokenToPkg, stageDir, workspacePath, artifactsDir, type Grant, type Ledger } from "./state.ts";
+import { fetchStoreIndex, downloadArtifact, redeemArtifact, cacheHit, RedeemError } from "./registry.ts";
+import { vaultGet, vaultSet } from "./vault.ts";
 import { loadManifest, landingAgentName, listScripts, agentScriptScope, shortName, type Manifest, type ServiceDecl } from "./manifest.ts";
 import { runSession, cancelSession, retireResident, retireResidents, autoTitleSession } from "./session.ts";
 import { runScript, mcpCall, type HostBridge } from "./scripts.ts";
-import { installPkg, buildPkg, removePkg, addGrant, removeGrant, resolveProvider, registryData, validateDir, harnessVerb, probeHarness, connectHarnessToken, launchHarnessLogin } from "./installer.ts";
+import { installPkg, buildPkg, removePkg, addGrant, removeGrant, resolveProvider, registryData, validateDir, harnessVerb, probeHarness, connectHarnessToken, launchHarnessLogin, prepareArtifact, activatePrepared, type Prepared } from "./installer.ts";
+import { readMarketIndex } from "./pack.ts";
 import { openDraft, readDraft, writeDraft, diffDraft, commitDraft, validateDraft, publishDraft, discardDraft, listDrafts, listReleases, rollbackRelease } from "./draft.ts";
 import { saveLedger } from "./state.ts";
 import { startServices, stopServices } from "./run.ts";
@@ -17,6 +20,11 @@ import { loginStart, loginRead, loginInput, loginStop } from "./login.ts";
 const RUNNER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_FILE = path.join(RUNNER_DIR, "..", "relay.manifest.yaml");
 const ASSETS_DIR = path.join(RUNNER_DIR, "..", "lib", "relayjs", "src");
+
+// 준비된 설치의 대기석. 고지서를 본 화면만 activate 에 닿도록 짧은 토큰으로 잇는다.
+// 릴리스 전개는 이미 디스크에 있으므로 만료되어도 잃는 것은 없다 — 다시 prepare 하면 재사용된다
+const prepared = new Map<string, { p: Prepared; at: number }>();
+const PREPARE_TTL = 10 * 60_000;
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -364,6 +372,146 @@ export function createApi(getLedger: () => Ledger, host: HostBridge, ticker: Tic
         return void res.end();
       }
       if (p === "/registry" && req.method === "GET") return void json(res, 200, registryData(getLedger()));
+
+      // ── 마켓 스튜디오(스토어 웹 /admin)의 선반 조회 — 스토어 오리진에만 CORS 를 연다.
+      // 선반 엔트리(disclosure 포함)가 등재 폼의 정본이고, 운영자 브라우저가 그 다리다.
+      // 다른 사이트는 Origin 이 달라 여기서 걸린다 (로컬 패키지 목록의 노출 방지)
+      const origin = String(req.headers.origin ?? "");
+      const storeOrigins = new Set(["http://localhost:3000", "http://127.0.0.1:3000"]);
+      if (STORE_INDEX_URL) {
+        try { storeOrigins.add(new URL(STORE_INDEX_URL).origin); } catch { /* URL 형식 아님 — dev 파일 경로 등 */ }
+      }
+      const corsPath = p === "/market/index" || /^\/market\/asset\/[A-Za-z0-9._-]+$/.test(p);
+      if (corsPath && storeOrigins.has(origin)) {
+        res.setHeader("access-control-allow-origin", origin);
+        res.setHeader("vary", "origin");
+        if (req.method === "OPTIONS") {
+          // Chrome Private Network Access: 공개 https 페이지 → 로컬 데몬은 이 프리플라이트를 지나야 한다
+          res.writeHead(204, {
+            "access-control-allow-methods": "GET",
+            "access-control-allow-private-network": "true",
+          });
+          return void res.end();
+        }
+      }
+
+      // ── 마켓: 로컬 선반 + 원격 스토어 병합 ─────────────────────
+      // 같은 ref 가 양쪽에 있으면 로컬이 이긴다 — 선반은 "발행 직전의 내 사본"이라
+      // 개발 중 오버라이드가 자연스럽다. 설치 여부는 origin.ref 로 대조.
+      // 원격 실패는 마켓을 죽이지 않는다: 로컬만 주고 사유를 remote_error 로 싣는다
+      if (p === "/market/index" && req.method === "GET") {
+        const l = getLedger();
+        const installedBy = (ref: string): string | null => {
+          for (const [name, rec] of Object.entries(l.packages)) {
+            if (rec.origin?.ref === ref) return name;
+            try {
+              if (loadManifest(rec.path).name === ref) return name;
+            } catch { /* 판정 실패 설치본 — 대조 불가로 넘어간다 */ }
+          }
+          return null;
+        };
+        const local = readMarketIndex().map((e) => ({ ...e, source: "local" as const }));
+        let remoteError: string | null = null;
+        let buy: string | null = null;
+        let remote: { source: string; [k: string]: unknown }[] = [];
+        if (STORE_INDEX_URL) {
+          try {
+            const idx = await fetchStoreIndex(STORE_INDEX_URL);
+            buy = idx.buy;
+            const seen = new Set(local.map((e) => e.ref));
+            remote = idx.entries
+              .filter((e) => !seen.has(e.ref))
+              .map((e) => ({ ...e, source: STORE_INDEX_URL }));
+          } catch (e) {
+            remoteError = e instanceof Error ? e.message : String(e);
+          }
+        }
+        const entries = [...remote, ...local]
+          .sort((a, b) => String(a.ref).localeCompare(String(b.ref)))
+          .map((e) => ({ ...e, installed: installedBy(String(e.ref)) }));
+        return void json(res, 200, { entries, remote: STORE_INDEX_URL || null, remote_error: remoteError, buy });
+      }
+      // 마켓 선반의 이미지 자산(아이콘 사본)만. 아티팩트 자체는 서빙하지 않는다 — 설치는 서버 로컬 경로로
+      const marketAsset = p.match(/^\/market\/asset\/([A-Za-z0-9._-]+)$/);
+      if (marketAsset && req.method === "GET") {
+        if (!/\.(svg|png|jpe?g|webp|gif|avif)$/i.test(marketAsset[1])) return void json(res, 404, { error: "이미지 자산만 서빙합니다" });
+        const file = path.join(artifactsDir(), marketAsset[1]);
+        if (!fs.existsSync(file)) return void json(res, 404, { error: "없는 자산" });
+        return void streamFile(file, res);
+      }
+
+      // ── 설치 2단 관문: 준비(정적) -> 동의 -> 활성(실행) ────────
+      // prepare 는 패키지 코드를 실행하지 않고 고지서까지만 만든다. 화면이 고지서를 보여주고
+      // 동의를 받은 뒤에야 activate 가 conform·setup·빌드·장부를 지난다. prepareId 는 고지서를
+      // 안 본 activate 를 막는 짧은 왕복 토큰이다
+      if (p === "/install/prepare" && req.method === "POST") {
+        const b = await readBody(req);
+        let abs: string;
+        let digest: string | undefined = b.digest ? String(b.digest) : undefined;
+        let registry: string | null = null;
+        if (b.ref) {
+          // ref 설치 — 로컬 선반 우선, 없으면 원격 스토어에서 받아 봉인 검증 후 같은 길로
+          const ref = String(b.ref);
+          const localHit = readMarketIndex().find((e) => e.ref === ref);
+          if (localHit) {
+            abs = path.join(artifactsDir(), localHit.file);
+            digest = localHit.digest;
+          } else if (STORE_INDEX_URL) {
+            const idx = await fetchStoreIndex(STORE_INDEX_URL);
+            const entry = idx.entries.find((e) => e.ref === ref);
+            if (!entry) return void json(res, 404, { error: `스토어에 없는 패키지: ${ref}` });
+            const paidCache = entry.price != null && !entry.url ? cacheHit(entry.digest) : null;
+            if (paidCache) {
+              // 이미 받은 봉투는 내 것 — 키를 묻지 않는다. 키를 묻는 순간부터는 반드시 검증한다
+              abs = paidCache;
+            } else if (entry.price != null && !entry.url) {
+              // 유료 — 키가 다운로드의 문을 연다. 키는 vault 에 앉아 재설치 때 다시 묻지 않는다
+              const key = (b.key ? String(b.key) : null) ?? vaultGet(`store-key/${entry.ref}`);
+              if (!key) {
+                return void json(res, 402, { error: `유료 패키지입니다 (₩${entry.price.toLocaleString()})`, need_key: true, ref: entry.ref, price: entry.price });
+              }
+              try {
+                abs = await redeemArtifact(STORE_INDEX_URL, idx.redeem, entry, key);
+              } catch (e) {
+                if (e instanceof RedeemError) {
+                  return void json(res, 402, { error: e.message, need_key: true, ref: entry.ref, price: entry.price });
+                }
+                throw e;
+              }
+              vaultSet(`store-key/${entry.ref}`, key.trim()); // redeem 을 통과한 키만 보관한다
+            } else {
+              abs = await downloadArtifact(STORE_INDEX_URL, entry);
+            }
+            digest = entry.digest;
+            registry = STORE_INDEX_URL;
+          } else {
+            return void json(res, 404, { error: `선반에 없는 패키지: ${ref} (스토어 미설정)` });
+          }
+        } else {
+          const file = String(b.file ?? "");
+          // 화면은 선반의 파일 이름만 안다 — 절대경로가 아니면 선반 아래로 봉인해 해석한다
+          abs = file.startsWith("/") ? file : path.join(artifactsDir(), path.basename(file));
+        }
+        const prep = prepareArtifact(getLedger(), abs, { name: b.name ? String(b.name) : undefined, digest, registry });
+        prepared.set(prep.id, { p: prep, at: Date.now() });
+        for (const [id, v] of prepared) if (Date.now() - v.at > PREPARE_TTL) prepared.delete(id);
+        const { manifest: _m, ...rest } = prep;
+        return void json(res, 200, { ...rest, display_name: prep.manifest.display_name });
+      }
+      if (p === "/install/activate" && req.method === "POST") {
+        const b = await readBody(req);
+        const held = prepared.get(String(b.id ?? ""));
+        if (!held || Date.now() - held.at > PREPARE_TTL) {
+          return void json(res, 410, { error: "만료된 준비입니다 — 설치를 처음부터 다시 시작하세요" });
+        }
+        prepared.delete(held.p.id);
+        const l = getLedger();
+        const r = activatePrepared(l, held.p, { workspace: b.workspace ? String(b.workspace) : undefined });
+        stopServices(held.p.name); // 업데이트라면 옛 릴리스 코드로 떠 있다 — 새 스냅샷으로 갈아탄다
+        const notes = startServices(l, held.p.name, held.p.dir, held.p.manifest);
+        ticker.emit(held.p.fresh ? "relay.package.installed" : "relay.package.published", { pkg: held.p.name, version: held.p.version });
+        return void json(res, 200, { name: r.name, fresh: held.p.fresh, version: held.p.version, setup: r.setup ?? null, build: r.build ?? null, services: notes });
+      }
 
       // 패키지 이미지 자산(카드 아바타 icon, 채널 배지 icon). 이미지 확장자만, 패키지 봉인
       const pkgAsset = p.match(/^\/pkg\/([^/]+)\/asset\/(.+)$/);

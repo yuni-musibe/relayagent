@@ -8,7 +8,8 @@ async function post(path: string, body: unknown): Promise<any> {
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.error ?? `${res.status} ${path}`);
+  // 에러 응답의 본문(need_key 등)을 버리지 않는다 — 호출부가 처방을 고르는 근거다
+  if (!res.ok) throw Object.assign(new Error(data?.error ?? `${res.status} ${path}`), { data, status: res.status });
   return data;
 }
 
@@ -109,4 +110,79 @@ export function setModel(pkg: string, model: string | null): Promise<{ ok: boole
 /** 대화형 로그인 발화 — 기판이 터미널 창을 연다 (인증은 그 창이 소유) */
 export function loginHarness(pkg: string, sw = false): Promise<{ launched: boolean; command: string; note: string }> {
   return post(`/pkg/${encodeURIComponent(pkg)}/harness/login`, { switch: sw });
+}
+
+// ── 마켓 — 로컬 선반(relay pack)과 설치 2단 관문 ────────────────
+
+export interface MarketDisclosure {
+  folders: { name: string; path: string }[];
+  network: { name: string; url: string; auth: string }[];
+  wakeups: { id: string; when: string }[];
+  llm: { provider: string; auth: string }[];
+  host: string[];
+  denied: string[];
+  borrows: string[];
+  spawns: string[];
+  channels: string[];
+  risk: "low" | "medium" | "high";
+}
+
+export interface MarketEntry {
+  ref: string;
+  /** 발행 주체 scope (예: "@yuni") */
+  seller: string;
+  version: string;
+  /** 로컬 선반 엔트리만 가진다 */
+  file?: string;
+  size: number;
+  digest: string;
+  display_name: string;
+  description: string;
+  icon: string | null;
+  files: number;
+  disclosure: MarketDisclosure;
+  packedAt: string;
+  /** "local" 또는 스토어 인덱스 URL */
+  source: string;
+  /** 원화 가격 — 존재하면 유료, 설치에 라이선스 키가 필요하다 */
+  price?: number;
+  /** 이 ref 가 이미 설치돼 있으면 그 설치 이름 */
+  installed: string | null;
+}
+
+export interface MarketIndex {
+  entries: MarketEntry[];
+  /** 설정된 스토어 인덱스 URL (미설정이면 null) */
+  remote: string | null;
+  /** 원격 조회 실패 사유 — 로컬 선반은 그대로 산다 */
+  remote_error: string | null;
+  /** 스토어의 구매 페이지 (인덱스 기준 상대 가능). ?ref= 를 붙여 연다 */
+  buy: string | null;
+}
+
+export function fetchMarket(): Promise<MarketIndex> {
+  return getJson("/market/index");
+}
+
+export interface PreparedInstall {
+  id: string;
+  name: string;
+  fresh: boolean;
+  ref: string;
+  version: string;
+  digest: string;
+  size: number;
+  disclosure: MarketDisclosure;
+  display_name: string;
+}
+
+/** 준비 — 봉인 검증과 고지서까지. 패키지 코드는 실행되지 않는다. 원격이면 다운로드가 이 안에서 일어난다.
+ *  유료인데 키가 없으면 402 로 던져진다 — (e as any).data?.need_key 로 구분해 키 입력을 처방한다 */
+export function prepareInstall(ref: string, key?: string): Promise<PreparedInstall> {
+  return post("/install/prepare", key ? { ref, key } : { ref });
+}
+
+/** 활성 — 동의 뒤에만. 여기서 처음 패키지 코드가 실행된다 */
+export function activateInstall(id: string): Promise<{ name: string; fresh: boolean; version: string; setup: { ok: boolean; out: string } | null; build: { ok: boolean; out: string } | null }> {
+  return post("/install/activate", { id });
 }

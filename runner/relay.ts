@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { API_URL, RELAY_HOME, loadLedger, workspacePath, PRINCIPAL } from "./state.ts";
+import { API_URL, RELAY_HOME, STORE_INDEX_URL, loadLedger, workspacePath, PRINCIPAL } from "./state.ts";
 import { installPkg, removePkg, addGrant, validateDir, registryData } from "./installer.ts";
 import { createApi, makeHostBridge } from "./api.ts";
 import { startServices, stopAll } from "./run.ts";
@@ -33,6 +33,26 @@ function flag(name: string): string | undefined {
 
 function has(name: string): boolean {
   return args.includes("--" + name);
+}
+
+/** 권한 고지서를 터미널 문장으로. 안 하는 것도 문장으로 적는다 — 없는 항목과 안 보여준 항목은 다르다 */
+function printDisclosure(d: import("./manifest.ts").Disclosure, name: string): string {
+  const lines: string[] = ["", "  설치하면 이렇게 됩니다"];
+  for (const f of d.folders) lines.push(`    폴더    ${f.path} 를 만들고 읽고 씁니다 (${f.name})`);
+  lines.push(`    폴더    workspace ~/Relay/${name} 이 세션의 땅이 됩니다 (설치 시 변경 가능)`);
+  for (const l of d.llm) lines.push(`    LLM     ${l.provider} 계정으로 돕니다 (${l.auth})`);
+  for (const n of d.network) lines.push(`    외부    ${n.url} 로 나갑니다 (자격: ${n.auth})`);
+  for (const w of d.wakeups) lines.push(`    자동    ${w.when} 에 스스로 깨어납니다 (${w.id})`);
+  for (const s of d.spawns) lines.push(`    실행    ${s} 를 띄웁니다`);
+  for (const b of d.borrows) lines.push(`    차용    ${b} — 활성화는 별도 결재(grant)`);
+  if (d.host.length) lines.push(`    호스트  ${d.host.join(", ")} 가 있어야 합니다`);
+  if (d.denied.length) lines.push(`    담장    ${d.denied.join(", ")} 에는 닿지 않겠다고 선언했습니다`);
+  const nots: string[] = [];
+  if (!d.network.length) nots.push("인터넷으로 나가지 않고");
+  if (!d.wakeups.length) nots.push("스스로 깨어나지 않고");
+  if (!d.borrows.length) nots.push("다른 패키지의 능력을 빌리지 않습니다");
+  if (nots.length) lines.push(`    이 패키지는 ${nots.join(", ").replace(/, ([^,]*)$/, ", $1")}`);
+  return lines.join("\n") + "\n";
 }
 
 async function main(): Promise<void> {
@@ -93,14 +113,68 @@ async function main(): Promise<void> {
     }
 
     case "install": {
-      const dir = args.find((a) => !a.startsWith("--"));
-      if (!dir) throw new Error("사용법: relay install <디렉토리> [--ring0] [--name n] [--workspace dir]");
-      const viaApi = await tryApi("/install", { path: dir, ring0: has("ring0"), workspace: flag("workspace") });
+      const target = args.find((a) => !a.startsWith("--"));
+      if (!target) throw new Error("사용법: relay install <디렉토리|아티팩트.relay> [--ring0] [--name n] [--workspace dir] [--yes] [--digest sha256:...]");
+
+      // 아티팩트(.relay) 또는 스토어 ref(@scope/name) — 봉인 검증과 동의 관문을 지나
+      // 릴리스 자리로 앉는다. 디렉토리 설치와 달리 동의 전에는 패키지 코드가 한 줄도 실행되지 않는다
+      if (/\.relay$/i.test(target) || target.startsWith("@")) {
+        const { prepareArtifact, activatePrepared } = await import("./installer.ts");
+        let p: import("./installer.ts").Prepared;
+        if (target.startsWith("@")) {
+          if (!STORE_INDEX_URL) throw new Error("스토어가 설정되지 않았습니다 — .env 에 RELAY_STORE_INDEX=<인덱스 URL> 을 지정하세요");
+          const { fetchStoreIndex, downloadArtifact, redeemArtifact } = await import("./registry.ts");
+          const { vaultGet, vaultSet } = await import("./vault.ts");
+          const idx = await fetchStoreIndex(STORE_INDEX_URL);
+          const entry = idx.entries.find((e) => e.ref === target);
+          if (!entry) throw new Error(`스토어에 없는 패키지: ${target}`);
+          let file: string;
+          const { cacheHit } = await import("./registry.ts");
+          const paidCache = entry.price != null && !entry.url ? cacheHit(entry.digest) : null;
+          if (paidCache) {
+            file = paidCache; // 이미 받은 봉투 — 키를 묻지 않는다
+          } else if (entry.price != null && !entry.url) {
+            const key = flag("key") ?? vaultGet(`store-key/${entry.ref}`);
+            if (!key) {
+              throw new Error(`유료 패키지입니다 (₩${entry.price.toLocaleString()}) — 구매 후 받은 키를 --key RELAY-... 로 넣으세요`);
+            }
+            file = await redeemArtifact(STORE_INDEX_URL, idx.redeem, entry, key);
+            vaultSet(`store-key/${entry.ref}`, key.trim());
+          } else {
+            file = await downloadArtifact(STORE_INDEX_URL, entry);
+          }
+          console.log(`받음: ${entry.ref}@${entry.version} (${(entry.size / 1024).toFixed(0)}KB, 봉인 대조 통과)`);
+          p = prepareArtifact(ledger, file, { name: flag("name"), digest: entry.digest, registry: STORE_INDEX_URL });
+        } else {
+          p = prepareArtifact(ledger, target, { name: flag("name"), digest: flag("digest") });
+        }
+        console.log(`${p.manifest.display_name} (${p.ref}@${p.version}, ${(p.size / 1024).toFixed(0)}KB)`);
+        console.log(`  봉인 확인됨 ${p.digest.slice(0, 22)}...`);
+        console.log(printDisclosure(p.disclosure, p.name));
+        if (!has("yes")) {
+          if (!process.stdin.isTTY) throw new Error("비대화형 설치에는 --yes 가 필요합니다 (위 고지서에 동의한다는 뜻입니다)");
+          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+          const answer = await new Promise<string>((resolve) => rl.question(p.fresh ? "설치할까요? [y/N] " : `업데이트할까요? (${p.name}) [y/N] `, resolve));
+          rl.close();
+          if (!/^y(es)?$/i.test(answer.trim())) {
+            console.log("설치하지 않았습니다");
+            break;
+          }
+        }
+        const r = activatePrepared(ledger, p, { ring0: has("ring0"), workspace: flag("workspace") });
+        console.log(`${p.fresh ? "설치됨" : "업데이트됨"}: ${r.name} (${p.ref}@${p.version}, workspace: ${workspacePath(ledger, r.name)})`);
+        if (r.setup && !r.setup.ok) console.error(`  하네스 setup 실패: ${r.setup.out}`);
+        if (r.build) console.log(`  view 빌드됨: ${r.build.out}`);
+        console.log("  데몬이 떠 있었다면 서비스는 다음 기동 때 새 릴리스로 뜹니다");
+        break;
+      }
+
+      const viaApi = await tryApi("/install", { path: target, ring0: has("ring0"), workspace: flag("workspace") });
       if (viaApi && !(viaApi as any).error) {
         console.log(`설치됨(daemon): ${JSON.stringify(viaApi)}`);
         break;
       }
-      const r = installPkg(ledger, dir, {
+      const r = installPkg(ledger, target, {
         ring0: has("ring0"),
         name: flag("name"),
         workspace: flag("workspace"),
@@ -109,6 +183,25 @@ async function main(): Promise<void> {
       console.log(`설치됨: ${r.name} (${r.manifest.name}@${r.manifest.version}, workspace: ${workspacePath(ledger, r.name)}${ledger.packages[r.name].ring === 0 ? ", ring-0" : ""})`);
       if (r.setup && !r.setup.ok) console.error(`  하네스 setup 실패: ${r.setup.out}`);
       if (r.build) console.log(`  view ${r.build.ok ? "빌드됨" : "빌드 실패"}: ${r.build.out}`);
+      break;
+    }
+
+    case "pack": {
+      const target = args.find((a) => !a.startsWith("--"));
+      if (!target) throw new Error("사용법: relay pack <설치이름|디렉토리> [--out 파일]");
+      // 설치 이름이면 장부 path(릴리스 스냅샷)를, 아니면 디렉토리를 굽는다
+      const dir = ledger.packages[target]?.path ?? path.resolve(target);
+      const { packDir, updateMarketIndex } = await import("./pack.ts");
+      const out = flag("out");
+      const r = packDir(dir, out);
+      console.log(`구움: ${r.ref}@${r.version} -> ${r.file}`);
+      console.log(`  파일 ${r.included.length}개, ${(r.size / 1024).toFixed(0)}KB, ${r.digest}`);
+      if (r.excluded.length) {
+        console.log(`  선언 밖이라 뺀 파일 ${r.excluded.length}개:`);
+        for (const f of r.excluded.slice(0, 20)) console.log(`    - ${f}`);
+        if (r.excluded.length > 20) console.log(`    ... 외 ${r.excluded.length - 20}개`);
+      }
+      if (!out) console.log(`  로컬 마켓 등재: ${updateMarketIndex(dir, r)}`);
       break;
     }
 

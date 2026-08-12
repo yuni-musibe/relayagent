@@ -1,13 +1,15 @@
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { saveLedger, expandHome, workspacePath, RELAY_HOME, type Grant, type Ledger } from "./state.ts";
-import { loadManifest, judge, activeHarness, ManifestError, type Manifest, type HarnessVariant } from "./manifest.ts";
+import { saveLedger, expandHome, workspacePath, RELAY_HOME, type Grant, type Ledger, type PkgOrigin } from "./state.ts";
+import { loadManifest, judge, activeHarness, disclosure, ManifestError, type Disclosure, type Manifest, type HarnessVariant } from "./manifest.ts";
 import { buildView, type BuildResult } from "./build.ts";
 import { conformHarness } from "./conform.ts";
 import { spawnEntrySync } from "./entry.ts";
 import { vaultGet, vaultSet } from "./vault.ts";
+import { sha256File, unpackArtifact } from "./pack.ts";
 import { parse as parseYaml } from "yaml";
 
 export interface InstallOpts {
@@ -46,46 +48,257 @@ export function judgeRequires(m: Manifest): void {
   if (issues.length) throw new ManifestError(issues);
 }
 
-export function installPkg(ledger: Ledger, dir: string, opts: InstallOpts = {}): InstallResult {
-  const abs = path.resolve(dir);
-  const m = loadManifest(abs);
-  judgeRequires(m); // 장부에 기록되기 전에 fail-loud
-  const name = opts.name ?? path.basename(abs);
-
-  // 계약 적합성은 설치 게이트다. 도구 미설치(환경 미비)와 계약 위반(어댑터 결함)은 다른 축이라
-  // conform 은 setup 실패를 위반으로 세지 않는다 — 여기서 막히는 것은 잘못 만든 어댑터뿐이다.
-  // 장부 기록 전에 던져야 거부된 패키지가 등재된 채 남지 않는다(judgeRequires 와 같은 자리)
-  const variants = m.harness?.variants ?? [];
-  const broken = variants
-    .map((v) => conformHarness(abs, v))
+/** 하네스 계약 검사 — 어댑터 동사를 실제 실행한다. 위반이면 fail-loud (장부 기록 전에 불러야 한다) */
+function judgeConform(pkgPath: string, m: Manifest): void {
+  const broken = (m.harness?.variants ?? [])
+    .map((v) => conformHarness(pkgPath, v))
     .filter((r) => !r.ok)
     .map((r) => `${r.variant}: ` + r.checks.filter((c) => !c.ok).map((c) => `${c.verb} — ${c.note}`).join(" / "));
   if (broken.length) {
     throw new ManifestError(["하네스 계약 위반 (relay harness-check 로 재현):", ...broken]);
   }
+}
 
+/** variant 전수 setup 을 돌려 쓸 수 있는 하네스를 선출한다 — installPkg 과 activatePrepared 공용 */
+function electHarness(pkgPath: string, m: Manifest): { picked: string | null; out: string } | null {
+  const variants = m.harness?.variants ?? [];
+  if (!variants.length) return null;
+  const reports: string[] = [];
+  let picked: string | null = null;
+  for (const v of variants) {
+    // Windows 에서는 엔트리 확장자 해석이 필요하다 — 이 레포의 어댑터 실행 규약(spawnEntrySync)을 따른다
+    const r = spawnEntrySync(path.join(pkgPath, v.source, v.entry), ["setup"], { encoding: "utf8" });
+    const out = ((r.stdout ?? "") + (r.stderr ?? "")).trim();
+    reports.push(`${v.name}: ${r.status === 0 ? "준비됨" : "불가"} — ${out}`);
+    if (r.status === 0 && !picked) picked = v.name;
+  }
+  return { picked, out: reports.join("\n") };
+}
+
+export function installPkg(ledger: Ledger, dir: string, opts: InstallOpts = {}): InstallResult {
+  const abs = path.resolve(dir);
+  const m = loadManifest(abs);
+  judgeRequires(m); // 장부에 기록되기 전에 fail-loud
+
+  // 계약 적합성은 설치 게이트다. 도구 미설치(환경 미비)와 계약 위반(어댑터 결함)은 다른 축이라
+  // conform 은 setup 실패를 위반으로 세지 않는다 — 여기서 막히는 것은 잘못 만든 어댑터뿐이다.
+  // 장부 기록 전에 던져야 거부된 패키지가 등재된 채 남지 않는다(judgeRequires 와 같은 자리)
+  judgeConform(abs, m);
+  const name = opts.name ?? path.basename(abs);
+
+  // 재설치는 결재·설정(ring, workspace, model, effort, harness, dirBindings)을 보존한다.
+  // 레코드를 통째로 갈면 ring-0 이 조용히 증발한다 — draft.ts 의 publishDraft 와 같은 계약
+  const prev = ledger.packages[name];
   ledger.packages[name] = {
+    ...(prev ?? {}),
     path: abs,
     ...(opts.workspace ? { workspace: path.resolve(expandHome(opts.workspace)) } : {}),
     ...(opts.ring0 ? { ring: 0 as const } : {}),
   };
   saveLedger(ledger);
   let setup: { ok: boolean; out: string } | undefined;
-  if (variants.length) {
-    const reports: string[] = [];
-    let picked: string | null = null;
-    for (const v of variants) {
-      const r = spawnEntrySync(path.join(abs, v.source, v.entry), ["setup"], { encoding: "utf8" });
-      const out = ((r.stdout ?? "") + (r.stderr ?? "")).trim();
-      reports.push(`${v.name}: ${r.status === 0 ? "준비됨" : "불가"} — ${out}`);
-      if (r.status === 0 && !picked) picked = v.name;
-    }
-    ledger.packages[name].harness = picked ?? variants[0].name;
+  const variants = m.harness?.variants ?? [];
+  const current = ledger.packages[name].harness;
+  // 활성 하네스가 새 선언에 살아 있으면 사용자의 선택을 존중하고, 없으면 선출한다
+  if (variants.length && (!current || !variants.some((v) => v.name === current))) {
+    const elected = electHarness(abs, m)!;
+    ledger.packages[name].harness = elected.picked ?? variants[0].name;
     saveLedger(ledger);
-    setup = { ok: picked != null, out: `활성 하네스: ${ledger.packages[name].harness}\n` + reports.join("\n") };
+    setup = { ok: elected.picked != null, out: `활성 하네스: ${ledger.packages[name].harness}\n` + elected.out };
   }
   const build = buildView(name, abs, m);
   return { name, manifest: m, setup, build };
+}
+
+// ── 아티팩트 설치: 준비(정적)와 활성(실행)의 분리 ────────────────────────────
+// 마켓에서 오는 패키지는 모르는 사람의 코드다. 동의 전에는 한 줄도 실행하지 않는다 —
+// prepare 는 봉인 검증·전개·판정·고지서 계산까지(전부 정적), activate 가 그 선을 넘는다
+// (conform·setup·빌드·장부). 장부 기록이 activate 에 있는 것이 계약이다: 동의하지 않은
+// 패키지는 장부에 남지 않는다.
+
+function lineageOf(rec: { path: string }): string | null {
+  try {
+    return loadManifest(rec.path).name;
+  } catch {
+    return null;
+  }
+}
+
+/** 두 트리의 내용 동일성 (.relay-digest 표식은 제외). 릴리스는 KB 급이라 전량 대조가 싸다 */
+function sameTree(a: string, b: string): boolean {
+  const list = (root: string, rel = ""): string[] => {
+    const out: string[] = [];
+    for (const e of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
+      const r = rel ? rel + "/" + e.name : e.name;
+      if (r === ".relay-digest") continue;
+      if (e.isDirectory()) out.push(...list(root, r));
+      else if (e.isFile()) out.push(r);
+    }
+    return out.sort();
+  };
+  const la = list(a);
+  const lb = list(b);
+  if (la.length !== lb.length || la.some((p, i) => p !== lb[i])) return false;
+  return la.every((p) => {
+    const fa = fs.readFileSync(path.join(a, p));
+    const fb = fs.readFileSync(path.join(b, p));
+    return fa.equals(fb);
+  });
+}
+
+/**
+ * 설치 이름 결정. 장부 키는 로컬 사정(디렉토리 이름)이라 @alice/todo 와 @bob/todo 가 같은
+ * "todo" 를 두고 부딪칠 수 있다 — 그 충돌을 여기서 해소한다. 같은 ref 의 기존 설치는 충돌이
+ * 아니라 업데이트다.
+ */
+export function resolveInstallName(ledger: Ledger, ref: string, explicit?: string): { name: string; fresh: boolean } {
+  if (explicit) {
+    const rec = ledger.packages[explicit];
+    if (!rec) return { name: explicit, fresh: true };
+    const cur = rec.origin?.ref ?? lineageOf(rec);
+    if (cur !== ref) throw new Error(`이미 있는 설치 이름: ${explicit} (${cur ?? "출처 불명"}) — 다른 --name 을 지정하세요`);
+    return { name: explicit, fresh: false };
+  }
+  for (const [name, rec] of Object.entries(ledger.packages)) {
+    if (rec.origin?.ref === ref) return { name, fresh: false };
+  }
+  const short = ref.split("/")[1] ?? ref.replace(/^@/, "");
+  const shortRec = ledger.packages[short];
+  if (!shortRec) return { name: short, fresh: true };
+  if (lineageOf(shortRec) === ref) return { name: short, fresh: false }; // 같은 혈통의 로컬 설치 — 그 자리를 잇는다
+  const scoped = ref.replace(/^@/, "").replace(/\//g, "-");
+  const scopedRec = ledger.packages[scoped];
+  if (!scopedRec) return { name: scoped, fresh: true };
+  if (lineageOf(scopedRec) === ref) return { name: scoped, fresh: false };
+  throw new Error(`설치 이름 충돌: ${short} 와 ${scoped} 가 모두 다른 패키지입니다 — --name 으로 지정하세요`);
+}
+
+export interface Prepared {
+  /** API 왕복용 토큰. CLI 는 쓰지 않는다 */
+  id: string;
+  name: string;
+  fresh: boolean;
+  ref: string;
+  version: string;
+  digest: string;
+  size: number;
+  /** 릴리스 자리(~/.relay/releases/<이름>/<버전>)에 이미 전개된 경로 */
+  dir: string;
+  registry: string | null;
+  manifest: Manifest;
+  disclosure: Disclosure;
+}
+
+/**
+ * 아티팩트 준비. 봉인 검증 -> 임시 전개 -> 매니페스트 판정 -> requires 실체 판정 ->
+ * 이름 결정 -> 릴리스 자리로 이동 -> 고지서 계산. 패키지 코드는 실행되지 않는다.
+ * 릴리스는 불변이라 같은 버전 자리에 다른 내용이 오면 거부한다 (.relay-digest 로 대조).
+ */
+export function prepareArtifact(
+  ledger: Ledger,
+  file: string,
+  opts: { name?: string; digest?: string; registry?: string | null } = {},
+): Prepared {
+  const abs = path.resolve(expandHome(file));
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`없는 아티팩트: ${file}`);
+  const digest = sha256File(abs);
+  if (opts.digest && opts.digest !== digest) {
+    throw new Error(`봉인 불일치: 기대 ${opts.digest}\n  실제 ${digest} — 아티팩트를 다시 받으세요`);
+  }
+  const staging = fs.mkdtempSync(path.join(RELAY_HOME, "run", "prepare-"));
+  try {
+    unpackArtifact(abs, staging);
+    const m = loadManifest(staging); // 판정 실패는 여기서 fail-loud
+    judgeRequires(m);
+    const { name, fresh } = resolveInstallName(ledger, m.name, opts.name);
+    const dest = path.join(RELAY_HOME, "releases", name, m.version);
+    const digestFile = path.join(dest, ".relay-digest");
+    if (fs.existsSync(dest)) {
+      const prev = fs.existsSync(digestFile) ? fs.readFileSync(digestFile, "utf8").trim() : null;
+      if (prev === digest) {
+        fs.rmSync(staging, { recursive: true, force: true }); // 같은 봉인 — 기존 스냅샷 재사용
+      } else if (prev === null && sameTree(staging, dest)) {
+        // 봉인 기록이 없는 릴리스 = 아티팩트 이전 시대의 로컬 발행본. 저자 컴퓨터에서
+        // 자기 발행본과 스토어 설치가 같은 자리를 두고 만나는 흔한 경우다 — 내용이
+        // 같음이 증명되면 그 자리를 입양한다. 불변 원칙은 지켜진다: 바뀌는 건 표식뿐이다
+        fs.writeFileSync(digestFile, digest + "\n");
+        fs.rmSync(staging, { recursive: true, force: true });
+      } else {
+        throw new Error(
+          `이미 있는 릴리스: ${name}@${m.version} — 릴리스는 불변입니다. ` +
+          `같은 버전에 다른 내용이 왔습니다 (기존: ${prev ?? "봉인 기록 없는 로컬 발행본"}). 버전을 올려 다시 구우세요`,
+        );
+      }
+    } else {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.renameSync(staging, dest);
+      fs.writeFileSync(digestFile, digest + "\n");
+    }
+    return {
+      id: crypto.randomBytes(12).toString("hex"),
+      name,
+      fresh,
+      ref: m.name,
+      version: m.version,
+      digest,
+      size: fs.statSync(abs).size,
+      dir: dest,
+      registry: opts.registry ?? null,
+      manifest: m,
+      disclosure: disclosure(m),
+    };
+  } catch (e) {
+    fs.rmSync(staging, { recursive: true, force: true });
+    throw e;
+  }
+}
+
+/**
+ * 준비된 패키지의 활성. 여기서 처음 패키지 코드가 실행된다(conform·setup·빌드).
+ * 순서가 계약이다: conform -> 빌드 -> 장부. 빌드 실패는 설치 실패다 — 깨진 화면으로
+ * "설치 성공" 을 만들지 않는다. 장부 반영은 전부 통과한 뒤 한 번이라 실패해도 장부는 무결하다.
+ * 업데이트는 rec.path 만 갈아 끼운다 — ring·workspace·model·harness 는 결재·설정이라 보존
+ * (publishDraft 와 같은 계약).
+ */
+export function activatePrepared(ledger: Ledger, p: Prepared, opts: InstallOpts = {}): InstallResult {
+  const m = p.manifest;
+  judgeConform(p.dir, m);
+  const build = buildView(p.name, p.dir, m);
+  if (build && !build.ok) {
+    throw new Error(`view 빌드 실패 — 설치를 중단합니다 (릴리스는 ${p.dir} 에 남아 있습니다):\n${build.out}`);
+  }
+
+  const origin: PkgOrigin = {
+    registry: p.registry,
+    ref: p.ref,
+    version: p.version,
+    digest: p.digest,
+    installedAt: new Date().toISOString(),
+  };
+  const existing = ledger.packages[p.name];
+  if (existing) {
+    existing.path = p.dir;
+    existing.origin = origin;
+    if (opts.workspace) existing.workspace = path.resolve(expandHome(opts.workspace));
+  } else {
+    ledger.packages[p.name] = {
+      path: p.dir,
+      origin,
+      ...(opts.workspace ? { workspace: path.resolve(expandHome(opts.workspace)) } : {}),
+      ...(opts.ring0 ? { ring: 0 as const } : {}),
+    };
+  }
+  // 활성 하네스가 새 선언에 살아 있으면 사용자의 선택을 존중하고, 없으면 재선출한다
+  let setup: { ok: boolean; out: string } | undefined;
+  const variants = m.harness?.variants ?? [];
+  const current = ledger.packages[p.name].harness;
+  if (variants.length && (!current || !variants.some((v) => v.name === current))) {
+    const elected = electHarness(p.dir, m)!;
+    ledger.packages[p.name].harness = elected.picked ?? variants[0].name;
+    setup = { ok: elected.picked != null, out: `활성 하네스: ${ledger.packages[p.name].harness}\n` + elected.out };
+  }
+  saveLedger(ledger);
+  return { name: p.name, manifest: m, setup, build: build ?? undefined };
 }
 
 export function buildPkg(ledger: Ledger, name: string): BuildResult {
@@ -337,7 +550,7 @@ export function registryData(ledger: Ledger): unknown {
     } catch (e) {
       error = String(e);
     }
-    return { name, path: rec.path, workspace: workspacePath(ledger, name), ring: rec.ring ?? null, model: rec.model ?? null, effort: rec.effort ?? null, harness: rec.harness ?? null, manifest, error };
+    return { name, path: rec.path, workspace: workspacePath(ledger, name), ring: rec.ring ?? null, model: rec.model ?? null, effort: rec.effort ?? null, harness: rec.harness ?? null, origin: rec.origin ?? null, manifest, error };
   });
   return { packages, grants: ledger.grants };
 }
