@@ -278,3 +278,97 @@ export function listScripts(pkgPath: string, m: Manifest): string[] {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter((f) => f.endsWith(".ts")).map((f) => f.replace(/\.ts$/, ""));
 }
+
+// ── 마켓플레이스 지반: 선언 경로 목록과 권한 고지서 ──────────────────────────
+
+export interface DeclaredPath {
+  path: string;
+  kind: "file" | "dir";
+}
+
+/**
+ * 매니페스트가 선언한 패키지 내부 경로 전부. judge() 의 mustExist 순회와 형제다.
+ * 차이 하나: judge 는 entry 파일 하나를 보지만 여기서는 source 디렉토리를 통째로 잡는다 —
+ * 어댑터·서비스·화면이 헬퍼 파일을 나눠 쓰므로 봉투는 디렉토리 단위여야 실행이 깨지지 않는다.
+ * 봉투(pack)와 발행 화면의 파일 목록이 이 함수 하나를 본다. 선언 밖 파일은 봉투에 없다.
+ */
+export function declaredPaths(m: Manifest): DeclaredPath[] {
+  const out: DeclaredPath[] = [{ path: "relay.yaml", kind: "file" }];
+  const file = (p?: string | null) => { if (p) out.push({ path: p, kind: "file" }); };
+  const dir = (p?: string | null) => { if (p) out.push({ path: p, kind: "dir" }); };
+
+  file(m.icon);
+  dir(m.surfaces?.view?.source); // out(빌드 산출물)은 pack 이 뺀다
+  for (const c of m.surfaces?.channels ?? []) { dir(c.source); file(c.icon); }
+  for (const v of m.harness?.variants ?? []) { dir(v.source); file(v.icon); file(v.llm?.icon); }
+  for (const a of m.agents ?? []) { file(a.persona); dir(a.skills); dir(a.commands); }
+  dir(m.scripts?.source);
+  for (const s of m.services ?? []) if ("source" in s && s.source != null) dir(s.source);
+  // services[].dir 은 사용자 홈의 폴더 요청이지 패키지 경로가 아니다 — 봉투에 담을 것이 없다
+  return out;
+}
+
+export interface Disclosure {
+  /** services[].dir — 사용자 컴퓨터에서 만들고 읽고 쓰는 폴더 */
+  folders: { name: string; path: string }[];
+  /** services[].url — 밖으로 나가는 접점과 자격의 형태 */
+  network: { name: string; url: string; auth: string }[];
+  /** triggers — 사용자가 없어도 스스로 깨어나는 시점 */
+  wakeups: { id: string; when: string }[];
+  /** harness.variants[].llm — 사용자의 어느 계정으로 도는가 */
+  llm: { provider: string; auth: string }[];
+  /** requires — 호스트에 미리 있어야 하는 것 */
+  host: string[];
+  /** hooks.deny — 닿지 않겠다고 스스로 선언한 경로 */
+  denied: string[];
+  /** edges — 다른 패키지에서 빌리겠다고 신청한 능력 */
+  borrows: string[];
+  /** services[].source — 패키지가 띄우는 프로세스·컨테이너 */
+  spawns: string[];
+  /** channels — 외부 대화 문 */
+  channels: string[];
+  /** 요구 범위. 위험이 아니라 넓이 — 화면 미터가 이 값을 그린다 */
+  risk: "low" | "medium" | "high";
+}
+
+/**
+ * 권한 고지서 — 매니페스트 선언에서 기계로 뽑는 사실 목록. 설치 동의 화면과 마켓 상세가
+ * 이걸 그린다. 홍보 문구가 아니라 선언이므로 판매자가 과장할 수 없고, 버전 간 diff 도
+ * 이 구조의 비교로 나온다.
+ */
+export function disclosure(m: Manifest): Disclosure {
+  const folders: Disclosure["folders"] = [];
+  const network: Disclosure["network"] = [];
+  const spawns: string[] = [];
+  for (const s of m.services ?? []) {
+    if ("dir" in s && s.dir != null) folders.push({ name: s.name, path: s.dir });
+    else if ("url" in s && s.url != null) network.push({ name: s.name, url: s.url, auth: s.auth?.kind ?? "none" });
+    else if ("source" in s && s.source != null) spawns.push(`${s.name} (${s.dockerfile ? "컨테이너" : "프로세스"})`);
+  }
+  const wakeups = (m.triggers ?? []).map((t) => ({
+    id: t.id,
+    when: t.when.cron ? `cron ${t.when.cron}${t.when.tz ? ` (${t.when.tz})` : ""}` : `event ${t.when.event}`,
+  }));
+  const llm = (m.harness?.variants ?? [])
+    .filter((v) => v.llm)
+    .map((v) => ({ provider: v.llm!.provider, auth: v.llm!.auth?.kind ?? "none" }));
+  const host: string[] = [];
+  if (m.requires?.os?.length) host.push(`OS: ${m.requires.os.join(", ")}`);
+  for (const b of m.requires?.binaries ?? []) host.push(b.name);
+  for (const a of m.requires?.apps ?? []) host.push(`${a.name}.app`);
+  const borrows = (m.edges ?? []).map((e) =>
+    `${e.provider}${e.mission ? ` (mission ${e.mission})` : e.tools?.length ? ` (tools ${e.tools.join(", ")})` : ""}`,
+  );
+  const channels = (m.surfaces?.channels ?? []).map((c) => c.name);
+
+  // 요구 범위 판정. high = 사용자 시야 밖에서 움직일 수 있는 선언(자동 실행, 외부 접점,
+  // 자기 프로세스, 타 패키지 차용). medium = 호스트나 대화 표면을 넓게 쓰는 선언. 나머지 low
+  const risk: Disclosure["risk"] =
+    wakeups.length || network.length || spawns.length || borrows.length
+      ? "high"
+      : host.length || channels.length || (m.hooks?.deny?.length ?? 0)
+        ? "medium"
+        : "low";
+
+  return { folders, network, wakeups, llm, host, denied: m.hooks?.deny ?? [], borrows, spawns, channels, risk };
+}
